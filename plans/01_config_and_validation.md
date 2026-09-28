@@ -105,11 +105,11 @@ Minimal starter text instructing the model who it is, what it has access to (`gi
 
 ## Verification Checklist
 
-- [ ] With a valid `.env` and `system_prompt.md`, `load_settings()` and `load_system_prompt()` both succeed and log expected output.
-- [ ] Removing any required field from `.env` produces a `ValidationError` naming the missing field — server does not start.
-- [ ] Setting `LLM_BASE_URL` to a non-HTTP string produces a validator error.
-- [ ] Deleting `system_prompt.md` produces `FileNotFoundError`.
-- [ ] `effective_input_budget` equals `MAX_CONTEXT_TOKENS − RESERVED_OUTPUT_TOKENS`.
+- [x] With a valid `.env` and `system_prompt.md`, `load_settings()` and `load_system_prompt()` both succeed and log expected output.
+- [x] Removing any required field from `.env` produces a `ValidationError` naming the missing field — server does not start.
+- [x] Setting `LLM_BASE_URL` to a non-HTTP string produces a validator error.
+- [x] Deleting `system_prompt.md` produces `FileNotFoundError`.
+- [x] `effective_input_budget` equals `MAX_CONTEXT_TOKENS − RESERVED_OUTPUT_TOKENS`.
 
 ## Definition of Done
 Config layer is the only thing that exists. No routes, no LLM calls, no HTTP clients. This plan is done when the verification checklist is fully green.
