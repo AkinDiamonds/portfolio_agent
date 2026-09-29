@@ -82,6 +82,12 @@ class Settings(BaseSettings):
         le=10,
         description="Maximum number of tool-call iterations per user turn.",
     )
+    llm_max_retries: int = Field(
+        default=2,
+        ge=1,
+        le=5,
+        description="Maximum number of attempts for LLM API calls on transient errors.",
+    )
     rate_limit_enabled: bool = Field(
         default=True,
         description="Enable per-IP rate limiting.",

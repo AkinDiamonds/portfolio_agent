@@ -1,48 +1,58 @@
 """
 app/main.py
 -----------
-FastAPI application entry point, lifecycle management, and bare /chat & /health routes.
+FastAPI application entry point, lifecycle management, and non-streaming /chat & /health routes.
 """
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
-import openai
 
-from app.config import load_settings, load_system_prompt
+from app.agent import LLMError, handle_turn
+from app.config import Settings, load_settings, load_system_prompt
+from app.github_tool import GithubTool
 from app.llm_client import create_llm_client
 from app.models import ChatRequest, ChatResponse, ErrorResponse
 
 logger = logging.getLogger(__name__)
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
-)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+    )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Startup and shutdown lifecycle handler.
 
-    Initializes application settings, system prompt, and LLM client on startup.
+    Initializes application settings, system prompt, LLM client, and GitHub tool on startup.
     Fails fast if any critical configuration is missing.
     """
     settings = load_settings()
     system_prompt = load_system_prompt()
     llm_client = create_llm_client(settings)
+    github_tool = GithubTool(
+        username=settings.github_username,
+        token=settings.github_token,
+    )
 
     app.state.settings = settings
     app.state.system_prompt = system_prompt
     app.state.llm_client = llm_client
+    app.state.github_tool = github_tool
 
     logger.info("Server ready")
-    yield
+    try:
+        yield
+    finally:
+        github_tool.close()
 
 
 app = FastAPI(
@@ -74,16 +84,17 @@ async def health() -> dict[str, str]:
     tags=["Chat"],
 )
 async def chat(body: ChatRequest, request: Request) -> JSONResponse | ChatResponse:
-    """Bare non-streaming chat endpoint.
+    """Non-streaming chat endpoint with agent loop.
 
     Assembles system prompt, conversation history, and current message,
-    sends to the LLM client, and returns the plain response.
+    executes the agent loop with tool support, and returns the plain JSON reply.
     """
+    settings: Settings = request.app.state.settings
     system_prompt: str = request.app.state.system_prompt
-    llm_client: openai.AsyncOpenAI = request.app.state.llm_client
-    model: str = request.app.state.settings.llm_model
+    llm_client = request.app.state.llm_client
+    github_tool: GithubTool = request.app.state.github_tool
 
-    messages: list[dict[str, str]] = [
+    messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt}
     ]
     for history_item in body.history:
@@ -91,19 +102,18 @@ async def chat(body: ChatRequest, request: Request) -> JSONResponse | ChatRespon
     messages.append({"role": "user", "content": body.message})
 
     try:
-        completion = await llm_client.chat.completions.create(
-            model=model,
-            messages=messages,  # type: ignore[arg-type]
-            stream=False,
+        reply = await handle_turn(
+            messages=messages,
+            settings=settings,
+            llm_client=llm_client,
+            github_tool=github_tool,
         )
-        reply = completion.choices[0].message.content or ""
         return ChatResponse(reply=reply)
-    except openai.APIError as exc:
-        err_msg = exc.message if hasattr(exc, "message") and exc.message else str(exc)
-        logger.error("LLM API error during /chat: %s", err_msg)
+    except LLMError as exc:
+        logger.error("LLM error during /chat: %s (recoverable=%s)", exc.message, exc.recoverable)
         return JSONResponse(
             status_code=status.HTTP_502_BAD_GATEWAY,
-            content={"error": f"LLM unavailable: {err_msg}"},
+            content={"error": exc.message, "recoverable": exc.recoverable},
         )
     except Exception as exc:
         logger.exception("Unexpected error during /chat")

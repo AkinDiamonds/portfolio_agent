@@ -32,7 +32,10 @@ class ChatMessage(BaseModel):
     def strip_content(cls, value: Any) -> Any:
         """Strip leading/trailing whitespace before validation."""
         if isinstance(value, str):
-            return value.strip()
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("Message content must not be empty or whitespace-only.")
+            return stripped
         return value
 
 
@@ -56,7 +59,10 @@ class ChatRequest(BaseModel):
     def strip_message(cls, value: Any) -> Any:
         """Strip leading/trailing whitespace before validation."""
         if isinstance(value, str):
-            return value.strip()
+            stripped = value.strip()
+            if not stripped:
+                raise ValueError("Message must not be empty or whitespace-only.")
+            return stripped
         return value
 
 
@@ -76,3 +82,8 @@ class ErrorResponse(BaseModel):
         ...,
         description="Description of the error that occurred.",
     )
+    recoverable: bool | None = Field(
+        default=None,
+        description="Whether the error is recoverable by retrying.",
+    )
+
