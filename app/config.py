@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from pydantic import Field, field_validator, computed_field
+from pydantic import Field, SecretStr, field_validator, computed_field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class Settings(BaseSettings):
         ...,
         description="Base URL of the OpenAI-compatible LLM provider (e.g. https://api.openai.com/v1).",
     )
-    llm_api_key: str = Field(
+    llm_api_key: SecretStr = Field(
         ...,
         description="API key for the LLM provider.",
     )
