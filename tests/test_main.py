@@ -71,6 +71,56 @@ class TestMainEndpoints(unittest.TestCase):
         self.assertEqual(called_messages[3], {"role": "user", "content": "Hi there"})
 
     @patch("app.main.handle_turn", new_callable=AsyncMock)
+    def test_chat_endpoint_budget_truncation(self, mock_handle_turn: AsyncMock) -> None:
+        """POST /chat truncates oldest history items when input exceeds budget."""
+        mock_handle_turn.return_value = "Trimmed reply"
+        # Temporarily restrict max_context_tokens to a small budget
+        tight_settings = Settings(
+            llm_base_url="https://api.openai.com/v1",
+            llm_api_key=SecretStr("sk-test-key"),
+            llm_model="gpt-4o-mini",
+            github_username="testuser",
+            github_token="ghp_testtoken",
+            allowed_origin="https://example.com",
+            max_context_tokens=1_200,
+            reserved_output_tokens=1_000,  # effective budget = 200 tokens
+        )
+        app.state.settings = tight_settings
+
+        payload = {
+            "message": "Latest question",
+            "history": [
+                {"role": "user", "content": "Old message " + ("x" * 400)},  # ~100 tokens
+                {"role": "assistant", "content": "Old reply " + ("y" * 400)},  # ~100 tokens
+                {"role": "user", "content": "Recent message"},
+            ],
+        }
+
+        try:
+            response = self.client.post("/chat", json=payload)
+            self.assertEqual(response.status_code, 200)
+            mock_handle_turn.assert_called_once()
+            called_messages = mock_handle_turn.call_args.kwargs["messages"]
+            # Oldest messages should be dropped, only recent message retained
+            self.assertEqual(called_messages[0]["role"], "system")
+            self.assertEqual(called_messages[-1]["content"], "Latest question")
+            contents = [m["content"] for m in called_messages]
+            self.assertFalse(
+                any(c.startswith("Old message") for c in contents),
+                "Oldest 'Old message' history entries should have been truncated",
+            )
+            self.assertFalse(
+                any(c.startswith("Old reply") for c in contents),
+                "Oldest 'Old reply' history entries should have been truncated",
+            )
+            self.assertTrue(
+                any("Recent message" in c for c in contents),
+                "Most recent history entry should be retained",
+            )
+        finally:
+            app.state.settings = self.settings
+
+    @patch("app.main.handle_turn", new_callable=AsyncMock)
     def test_chat_endpoint_llm_error_502(self, mock_handle_turn: AsyncMock) -> None:
         """POST /chat returns 502 Bad Gateway with structured error on LLMError."""
         mock_handle_turn.side_effect = LLMError("LLM unavailable: 401 Unauthorized", recoverable=False)

@@ -14,8 +14,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.responses import JSONResponse
 
 from app.agent import LLMError, handle_turn
+from app.budget import build_messages, estimate_tokens
 from app.config import Settings, load_settings, load_system_prompt
-from app.github_tool import GithubTool
+from app.github_tool import GITHUB_TOOL_SCHEMA, GithubTool
 from app.llm_client import create_llm_client
 from app.models import ChatRequest, ChatResponse, ErrorResponse
 
@@ -37,6 +38,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """
     settings = load_settings()
     system_prompt = load_system_prompt()
+    logger.info("System prompt fixed cost: %d tokens", estimate_tokens(system_prompt))
+
     llm_client = create_llm_client(settings)
     github_tool = GithubTool(
         username=settings.github_username,
@@ -94,12 +97,13 @@ async def chat(body: ChatRequest, request: Request) -> JSONResponse | ChatRespon
     llm_client = request.app.state.llm_client
     github_tool: GithubTool = request.app.state.github_tool
 
-    messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt}
-    ]
-    for history_item in body.history:
-        messages.append({"role": history_item.role, "content": history_item.content})
-    messages.append({"role": "user", "content": body.message})
+    messages = build_messages(
+        system_prompt=system_prompt,
+        tool_schema=GITHUB_TOOL_SCHEMA,
+        history=body.history,
+        message=body.message,
+        budget=settings.effective_input_budget,
+    )
 
     try:
         reply = await handle_turn(

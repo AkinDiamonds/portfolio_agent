@@ -16,6 +16,7 @@ from pydantic import SecretStr
 from app.agent import LLMError, handle_turn
 from app.config import Settings
 from app.github_tool import GithubTool
+from typing import Any
 
 
 def _create_mock_completion(

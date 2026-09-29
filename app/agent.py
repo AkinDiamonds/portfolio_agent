@@ -17,6 +17,7 @@ from typing import Any
 import openai
 from openai.types.chat import ChatCompletion
 
+from app.budget import build_messages
 from app.config import Settings
 from app.github_tool import GITHUB_TOOL_SCHEMA, GithubLookupArgs, GithubTool
 
