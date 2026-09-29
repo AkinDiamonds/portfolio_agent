@@ -67,7 +67,7 @@ class ChatRequest(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """The response payload for a non-streaming chat turn."""
+    """The response payload for a non-streaming chat turn (retained for backward compatibility)."""
 
     reply: str = Field(
         ...,

@@ -7,14 +7,15 @@ Integration tests for FastAPI endpoints in app/main.py.
 from __future__ import annotations
 
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import AsyncIterator
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 from pydantic import SecretStr
 
-from app.agent import LLMError
 from app.config import Settings
 from app.main import app
+from app.sse import sse_done, sse_status, sse_token
 
 
 class TestMainEndpoints(unittest.TestCase):
@@ -45,10 +46,16 @@ class TestMainEndpoints(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json(), {"status": "ok"})
 
-    @patch("app.main.handle_turn", new_callable=AsyncMock)
-    def test_chat_endpoint_success(self, mock_handle_turn: AsyncMock) -> None:
-        """POST /chat calls handle_turn and returns reply."""
-        mock_handle_turn.return_value = "Hello from agent!"
+    @patch("app.main.handle_turn")
+    def test_chat_endpoint_streaming_success(self, mock_handle_turn: MagicMock) -> None:
+        """POST /chat calls handle_turn and returns StreamingResponse with SSE headers."""
+        async def _mock_events(*args, **kwargs) -> AsyncIterator[str]:
+            yield sse_status("checking GitHub...")
+            yield sse_token("Hello ")
+            yield sse_token("world!")
+            yield sse_done()
+
+        mock_handle_turn.side_effect = _mock_events
 
         payload = {
             "message": "Hi there",
@@ -60,7 +67,17 @@ class TestMainEndpoints(unittest.TestCase):
 
         response = self.client.post("/chat", json=payload)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"reply": "Hello from agent!"})
+        self.assertIn("text/event-stream", response.headers["content-type"])
+        self.assertEqual(response.headers["cache-control"], "no-cache")
+        self.assertEqual(response.headers["x-accel-buffering"], "no")
+
+        expected_body = (
+            sse_status("checking GitHub...")
+            + sse_token("Hello ")
+            + sse_token("world!")
+            + sse_done()
+        )
+        self.assertEqual(response.text, expected_body)
 
         mock_handle_turn.assert_called_once()
         called_messages = mock_handle_turn.call_args.kwargs["messages"]
@@ -70,10 +87,15 @@ class TestMainEndpoints(unittest.TestCase):
         self.assertEqual(called_messages[2], {"role": "assistant", "content": "Greetings"})
         self.assertEqual(called_messages[3], {"role": "user", "content": "Hi there"})
 
-    @patch("app.main.handle_turn", new_callable=AsyncMock)
-    def test_chat_endpoint_budget_truncation(self, mock_handle_turn: AsyncMock) -> None:
+    @patch("app.main.handle_turn")
+    def test_chat_endpoint_budget_truncation(self, mock_handle_turn: MagicMock) -> None:
         """POST /chat truncates oldest history items when input exceeds budget."""
-        mock_handle_turn.return_value = "Trimmed reply"
+        async def _mock_events(*args, **kwargs) -> AsyncIterator[str]:
+            yield sse_token("Trimmed reply")
+            yield sse_done()
+
+        mock_handle_turn.side_effect = _mock_events
+
         # Temporarily restrict max_context_tokens to a small budget
         tight_settings = Settings(
             llm_base_url="https://api.openai.com/v1",
@@ -120,24 +142,10 @@ class TestMainEndpoints(unittest.TestCase):
         finally:
             app.state.settings = self.settings
 
-    @patch("app.main.handle_turn", new_callable=AsyncMock)
-    def test_chat_endpoint_llm_error_502(self, mock_handle_turn: AsyncMock) -> None:
-        """POST /chat returns 502 Bad Gateway with structured error on LLMError."""
-        mock_handle_turn.side_effect = LLMError("LLM unavailable: 401 Unauthorized", recoverable=False)
-
-        payload = {"message": "Hello"}
-        response = self.client.post("/chat", json=payload)
-
-        self.assertEqual(response.status_code, 502)
-        data = response.json()
-        self.assertIn("error", data)
-        self.assertEqual(data["error"], "LLM unavailable: 401 Unauthorized")
-        self.assertFalse(data["recoverable"])
-
-    @patch("app.main.handle_turn", new_callable=AsyncMock)
-    def test_chat_endpoint_unexpected_error_500(self, mock_handle_turn: AsyncMock) -> None:
-        """POST /chat returns 500 on unexpected exception."""
-        mock_handle_turn.side_effect = RuntimeError("Fatal crash")
+    @patch("app.main.build_messages")
+    def test_chat_endpoint_assembly_error_500(self, mock_build_messages: MagicMock) -> None:
+        """POST /chat returns 500 JSON if error occurs before stream starts."""
+        mock_build_messages.side_effect = RuntimeError("Fatal message assembly crash")
 
         payload = {"message": "Hello"}
         response = self.client.post("/chat", json=payload)
@@ -185,4 +193,3 @@ class TestMainEndpoints(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

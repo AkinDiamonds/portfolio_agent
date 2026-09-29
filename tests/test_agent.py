@@ -1,22 +1,23 @@
 """
 tests/test_agent.py
 -------------------
-Unit tests for the agent loop in app/agent.py.
+Unit tests for the agent loop and SSE streaming in app/agent.py.
 """
 
 from __future__ import annotations
 
 import json
 import unittest
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import openai
 from pydantic import SecretStr
 
-from app.agent import LLMError, handle_turn
+from app.agent import handle_turn
 from app.config import Settings
 from app.github_tool import GithubTool
-from typing import Any
+from app.sse import sse_done, sse_error, sse_status, sse_token
 
 
 def _create_mock_completion(
@@ -29,6 +30,7 @@ def _create_mock_completion(
     choice_mock.finish_reason = finish_reason
     choice_mock.message.content = content
     choice_mock.message.tool_calls = tool_calls
+    choice_mock.delta.content = content
 
     completion_mock = MagicMock()
     completion_mock.choices = [choice_mock]
@@ -71,7 +73,7 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.mock_github_tool = MagicMock(spec=GithubTool)
 
     async def test_direct_answer_no_tools(self) -> None:
-        """A question requiring no tool returns direct answer in one LLM call."""
+        """A question requiring no tool yields token event then done event, no status events."""
         direct_completion = _create_mock_completion(
             content="Hello! How can I help you today?",
             finish_reason="stop",
@@ -84,19 +86,28 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "Hello"},
         ]
 
-        reply = await handle_turn(
-            messages=messages,
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=messages,
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "Hello! How can I help you today?")
+        self.assertEqual(
+            events,
+            [
+                sse_token("Hello! How can I help you today?"),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 1)
         self.mock_github_tool.execute.assert_not_called()
 
     async def test_tool_call_cycle_and_final_answer(self) -> None:
-        """Tool call is executed, result appended, and model produces final answer."""
+        """Tool call yields status event, executes tool, then streams final answer."""
         tool_call = _create_mock_tool_call(
             call_id="call_123",
             function_name="github_lookup",
@@ -124,14 +135,24 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "What repos do you have?"},
         ]
 
-        reply = await handle_turn(
-            messages=messages,
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=messages,
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "Here are your repositories: repo-a, repo-b.")
+        self.assertEqual(
+            events,
+            [
+                sse_status("checking GitHub..."),
+                sse_token("Here are your repositories: repo-a, repo-b."),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 2)
         self.mock_github_tool.execute.assert_called_once_with(tool_call.function.arguments)
 
@@ -145,7 +166,7 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertIn("repo-a", second_call_messages[3]["content"])
 
     async def test_max_tool_iterations_exhaustion(self) -> None:
-        """When max_tool_iterations is reached, system note is added and final call made without tools."""
+        """When max_tool_iterations is reached, system note is added and final call streamed without tools."""
         self.settings.max_tool_iterations = 1
 
         tool_call = _create_mock_tool_call(
@@ -175,25 +196,36 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "Tell me everything"},
         ]
 
-        reply = await handle_turn(
-            messages=messages,
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=messages,
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "Based on available info, here is the answer.")
+        self.assertEqual(
+            events,
+            [
+                sse_status("checking GitHub..."),
+                sse_token("Based on available info, here is the answer."),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 2)
 
-        # Verify last call had no tools and had system note appended
+        # Verify last call had no tools, stream=True, and system note appended
         last_call_kwargs = self.mock_llm_client.chat.completions.create.call_args_list[-1].kwargs
         self.assertIsNone(last_call_kwargs.get("tools"))
+        self.assertTrue(last_call_kwargs.get("stream"))
         last_messages = last_call_kwargs["messages"]
         self.assertEqual(last_messages[-1]["role"], "system")
         self.assertIn("Tool access is exhausted", last_messages[-1]["content"])
 
     async def test_malformed_tool_call_graceful_degradation(self) -> None:
-        """Malformed tool arguments log warning and degrade to plain answer mode."""
+        """Malformed tool arguments degrade to streaming plain answer mode without status event."""
         malformed_tool_call = _create_mock_tool_call(
             call_id="call_bad",
             function_name="github_lookup",
@@ -220,20 +252,29 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "Show my projects"},
         ]
 
-        reply = await handle_turn(
-            messages=messages,
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
+        events = [
+            event
+            async for event in handle_turn(
+                messages=messages,
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
+
+        self.assertEqual(
+            events,
+            [
+                sse_token("I cannot check GitHub right now, but here is what I know."),
+                sse_done(),
+            ],
         )
-
-        self.assertEqual(reply, "I cannot check GitHub right now, but here is what I know.")
-        # GithubTool execute was not called because args were malformed
+        # Tool was not executed
         self.mock_github_tool.execute.assert_not_called()
-
-        # Second call was without tools
+        # Second call was with stream=True and without tools
         second_call_kwargs = self.mock_llm_client.chat.completions.create.call_args_list[1].kwargs
         self.assertIsNone(second_call_kwargs.get("tools"))
+        self.assertTrue(second_call_kwargs.get("stream"))
 
     async def test_llm_retry_on_api_error_success(self) -> None:
         """One transient APIError is retried and succeeds."""
@@ -249,19 +290,28 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
-            reply = await handle_turn(
-                messages=[{"role": "user", "content": "Hi"}],
-                settings=self.settings,
-                llm_client=self.mock_llm_client,
-                github_tool=self.mock_github_tool,
-            )
+            events = [
+                event
+                async for event in handle_turn(
+                    messages=[{"role": "user", "content": "Hi"}],
+                    settings=self.settings,
+                    llm_client=self.mock_llm_client,
+                    github_tool=self.mock_github_tool,
+                )
+            ]
             mock_sleep.assert_awaited_once_with(1)
 
-        self.assertEqual(reply, "Recovered after retry!")
+        self.assertEqual(
+            events,
+            [
+                sse_token("Recovered after retry!"),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 2)
 
-    async def test_llm_retry_on_api_error_failure_raises_llmerror(self) -> None:
-        """Two consecutive APIErrors raise unrecoverable LLMError."""
+    async def test_llm_retry_on_api_error_failure_yields_sse_error(self) -> None:
+        """Two consecutive APIErrors yield sse_error event and no sse_done."""
         api_error = openai.APIError("API down", request=MagicMock(), body=None)
         self.mock_llm_client.chat.completions.create.side_effect = [
             api_error,
@@ -269,36 +319,42 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         ]
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
-            with self.assertRaises(LLMError) as cm:
-                await handle_turn(
+            events = [
+                event
+                async for event in handle_turn(
                     messages=[{"role": "user", "content": "Hi"}],
                     settings=self.settings,
                     llm_client=self.mock_llm_client,
                     github_tool=self.mock_github_tool,
                 )
+            ]
 
-        self.assertIn("LLM unavailable", cm.exception.message)
-        self.assertFalse(cm.exception.recoverable)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0], sse_error("LLM unavailable: API down", recoverable=False))
+        self.assertNotIn(sse_done(), events)
 
-    async def test_empty_choices_raises_llmerror(self) -> None:
-        """LLM returning empty choices list raises LLMError."""
+    async def test_empty_choices_yields_sse_error(self) -> None:
+        """LLM returning empty choices list yields sse_error."""
         empty_choices_completion = MagicMock()
         empty_choices_completion.choices = []
 
         self.mock_llm_client.chat.completions.create.return_value = empty_choices_completion
 
-        with self.assertRaises(LLMError) as cm:
-            await handle_turn(
+        events = [
+            event
+            async for event in handle_turn(
                 messages=[{"role": "user", "content": "Hi"}],
                 settings=self.settings,
                 llm_client=self.mock_llm_client,
                 github_tool=self.mock_github_tool,
             )
-        self.assertIn("no choices", cm.exception.message)
+        ]
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0], sse_error("LLM response contained no choices", recoverable=False))
 
     async def test_malformed_tool_args_schema_validation_failure(self) -> None:
-        """Valid JSON but missing required action parameters degrades gracefully."""
-        # get_readme requires repo parameter
+        """Valid JSON but missing required action parameters degrades gracefully to streaming."""
         tool_call = _create_mock_tool_call(
             call_id="call_missing_repo",
             function_name="github_lookup",
@@ -320,18 +376,27 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             degraded_completion,
         ]
 
-        reply = await handle_turn(
-            messages=[{"role": "user", "content": "Get readme"}],
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=[{"role": "user", "content": "Get readme"}],
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "I cannot look up that repo without its name.")
+        self.assertEqual(
+            events,
+            [
+                sse_token("I cannot look up that repo without its name."),
+                sse_done(),
+            ],
+        )
         self.mock_github_tool.execute.assert_not_called()
 
     async def test_multiple_sequential_tool_calls(self) -> None:
-        """Agent executes two tool calls in sequence before producing final answer."""
+        """Agent executes two tool calls in sequence yielding status events before producing final answer."""
         tc1 = _create_mock_tool_call(
             call_id="call_1",
             function_name="github_lookup",
@@ -353,19 +418,30 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             "# Cool App\nA web application",
         ]
 
-        reply = await handle_turn(
-            messages=[{"role": "user", "content": "What is cool-app?"}],
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=[{"role": "user", "content": "What is cool-app?"}],
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "Cool app is a web application.")
+        self.assertEqual(
+            events,
+            [
+                sse_status("checking GitHub..."),
+                sse_status("checking GitHub..."),
+                sse_token("Cool app is a web application."),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 3)
         self.assertEqual(self.mock_github_tool.execute.call_count, 2)
 
     async def test_parallel_tool_calls_in_single_turn(self) -> None:
-        """Multiple tool calls in a single completion are executed and appended properly."""
+        """Multiple tool calls in a single completion are executed with one status event and appended properly."""
         tc1 = _create_mock_tool_call(
             call_id="call_1",
             function_name="github_lookup",
@@ -402,20 +478,30 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
             {"role": "user", "content": "Get repos and profile"},
         ]
 
-        reply = await handle_turn(
-            messages=messages,
-            settings=self.settings,
-            llm_client=self.mock_llm_client,
-            github_tool=self.mock_github_tool,
-        )
+        events = [
+            event
+            async for event in handle_turn(
+                messages=messages,
+                settings=self.settings,
+                llm_client=self.mock_llm_client,
+                github_tool=self.mock_github_tool,
+            )
+        ]
 
-        self.assertEqual(reply, "Here are your repos and profile details.")
+        self.assertEqual(
+            events,
+            [
+                sse_status("checking GitHub..."),
+                sse_token("Here are your repos and profile details."),
+                sse_done(),
+            ],
+        )
         self.assertEqual(self.mock_llm_client.chat.completions.create.call_count, 2)
         self.assertEqual(self.mock_github_tool.execute.call_count, 2)
 
-        # Check second LLM call messages
+        # Verify second LLM call received assistant tool_calls and corresponding tool results in order
         second_call_messages = self.mock_llm_client.chat.completions.create.call_args_list[1].kwargs["messages"]
-        # system + user + assistant (with 2 tool_calls) + 2 tool messages = 5 messages
+        # system + user + assistant (with 2 tool_calls) + 2 tool result messages = 5 messages
         self.assertEqual(len(second_call_messages), 5)
         self.assertEqual(second_call_messages[2]["role"], "assistant")
         self.assertEqual(len(second_call_messages[2]["tool_calls"]), 2)
@@ -424,28 +510,57 @@ class TestAgentLoop(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second_call_messages[4]["role"], "tool")
         self.assertEqual(second_call_messages[4]["tool_call_id"], "call_2")
 
-    async def test_unexpected_finish_reason_logs_warning_and_returns_content(self) -> None:
-        """Unexpected finish_reason (e.g., length) logs warning and returns content."""
-        length_completion = _create_mock_completion(
-            content="Truncated output...",
-            finish_reason="length",
-            tool_calls=None,
-        )
-        self.mock_llm_client.chat.completions.create.return_value = length_completion
+    async def test_streaming_token_chunks(self) -> None:
+        """Streaming response delivers multiple token chunks followed by done."""
+        # Async iterator of chunks to mock real OpenAI AsyncStream chunks
+        async def _mock_stream():
+            for text in ["Hello", " world", "!"]:
+                chunk = MagicMock()
+                chunk.choices = [MagicMock()]
+                chunk.choices[0].delta.content = text
+                yield chunk
 
-        with self.assertLogs("app.agent", level="WARNING") as log_cm:
-            reply = await handle_turn(
-                messages=[{"role": "user", "content": "Long request"}],
+        self.mock_llm_client.chat.completions.create.return_value = _mock_stream()
+
+        # Setting max_tool_iterations = 0 causes the tool loop to exit immediately
+        # and invoke the final streaming response path directly
+        self.settings.max_tool_iterations = 0
+
+        events = [
+            event
+            async for event in handle_turn(
+                messages=[{"role": "user", "content": "Hi"}],
                 settings=self.settings,
                 llm_client=self.mock_llm_client,
                 github_tool=self.mock_github_tool,
             )
+        ]
 
-        self.assertEqual(reply, "Truncated output...")
-        self.assertTrue(any("unexpected finish_reason: length" in o for o in log_cm.output))
+        self.assertEqual(
+            events,
+            [
+                sse_token("Hello"),
+                sse_token(" world"),
+                sse_token("!"),
+                sse_done(),
+            ],
+        )
+
+    async def test_stream_final_answer_invalid_retry_config(self) -> None:
+        """_stream_final_answer yields sse_error if max_retries <= 0."""
+        from app.agent import _stream_final_answer
+
+        events = [
+            event
+            async for event in _stream_final_answer(
+                llm_client=self.mock_llm_client,
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": "test"}],
+                max_retries=0,
+            )
+        ]
+        self.assertEqual(events, [sse_error("Invalid retry configuration", recoverable=False)])
 
 
 if __name__ == "__main__":
     unittest.main()
-
-
