@@ -15,6 +15,7 @@ from pydantic import SecretStr
 
 from app.config import Settings
 from app.main import app
+from app.rate_limit import RateLimiter
 from app.sse import sse_done, sse_status, sse_token
 
 
@@ -33,10 +34,13 @@ class TestMainEndpoints(unittest.TestCase):
         self.mock_llm_client = MagicMock()
         self.mock_github_tool = MagicMock()
 
+        self.rate_limiter = RateLimiter(per_minute=20, enabled=True)
+
         app.state.settings = self.settings
         app.state.system_prompt = self.system_prompt
         app.state.llm_client = self.mock_llm_client
         app.state.github_tool = self.mock_github_tool
+        app.state.rate_limiter = self.rate_limiter
 
         self.client = TestClient(app, raise_server_exceptions=False)
 
@@ -189,6 +193,100 @@ class TestMainEndpoints(unittest.TestCase):
             self.assertEqual(test_app.state.github_tool, mock_gt_instance)
 
         mock_gt_instance.close.assert_called_once()
+        self.assertIsNotNone(getattr(test_app.state, "rate_limiter", None))
+
+    @patch("app.main.handle_turn")
+    def test_chat_endpoint_rate_limited_429(self, mock_handle_turn: MagicMock) -> None:
+        """POST /chat returns 429 when rate limit is exceeded, before stream starts."""
+        # Configure a limiter with 2 requests allowed
+        app.state.rate_limiter = RateLimiter(per_minute=2, enabled=True)
+
+        async def _mock_events(*args, **kwargs) -> AsyncIterator[str]:
+            yield sse_token("reply")
+            yield sse_done()
+
+        mock_handle_turn.side_effect = _mock_events
+        payload = {"message": "Hello"}
+
+        # Request 1: allowed
+        res1 = self.client.post("/chat", json=payload)
+        self.assertEqual(res1.status_code, 200)
+
+        # Request 2: allowed
+        res2 = self.client.post("/chat", json=payload)
+        self.assertEqual(res2.status_code, 200)
+
+        # Request 3: rate limited -> HTTP 429
+        res3 = self.client.post("/chat", json=payload)
+        self.assertEqual(res3.status_code, 429)
+        self.assertEqual(
+            res3.json(),
+            {"error": "Too many requests. Please wait before sending another message."},
+        )
+        # handle_turn should only have been called twice, not on 3rd request
+        self.assertEqual(mock_handle_turn.call_count, 2)
+
+    def test_health_endpoint_not_rate_limited(self) -> None:
+        """GET /health is never blocked by rate limiting."""
+        # Limiter with 0 capacity or exhausted
+        app.state.rate_limiter = RateLimiter(per_minute=1, enabled=True)
+        # Exhaust limiter
+        app.state.rate_limiter.is_allowed("testclient")
+
+        # Health check must still return 200
+        for _ in range(5):
+            res = self.client.get("/health")
+            self.assertEqual(res.status_code, 200)
+            self.assertEqual(res.json(), {"status": "ok"})
+
+    @patch("app.main.handle_turn")
+    def test_rate_limiter_disabled_allows_unlimited(self, mock_handle_turn: MagicMock) -> None:
+        """When rate limiting is disabled, requests proceed without 429."""
+        app.state.rate_limiter = RateLimiter(per_minute=1, enabled=False)
+
+        async def _mock_events(*args, **kwargs) -> AsyncIterator[str]:
+            yield sse_token("reply")
+            yield sse_done()
+
+        mock_handle_turn.side_effect = _mock_events
+        payload = {"message": "Hello"}
+
+        for _ in range(10):
+            res = self.client.post("/chat", json=payload)
+            self.assertEqual(res.status_code, 200)
+
+    def test_cors_matching_origin_allowed(self) -> None:
+        """Requests from configured ALLOWED_ORIGIN receive CORS allow header."""
+        allowed_origin = self.settings.allowed_origin
+        res = self.client.get(
+            "/health",
+            headers={"Origin": allowed_origin},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers.get("access-control-allow-origin"), allowed_origin)
+
+    def test_cors_mismatching_origin_rejected(self) -> None:
+        """Requests from an unauthorized origin do not receive CORS allow header."""
+        res = self.client.get(
+            "/health",
+            headers={"Origin": "https://unauthorized-domain.com"},
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertIsNone(res.headers.get("access-control-allow-origin"))
+
+    def test_cors_options_preflight(self) -> None:
+        """OPTIONS preflight request from allowed origin returns 200 with CORS headers."""
+        res = self.client.options(
+            "/chat",
+            headers={
+                "Origin": "https://example.com",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type",
+            },
+        )
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(res.headers.get("access-control-allow-origin"), "https://example.com")
+        self.assertIn("POST", res.headers.get("access-control-allow-methods", ""))
 
 
 if __name__ == "__main__":

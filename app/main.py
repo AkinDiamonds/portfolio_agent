@@ -7,11 +7,14 @@ FastAPI application entry point, lifecycle management, and SSE streaming /chat &
 from __future__ import annotations
 
 import logging
+import contextvars
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
 from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from app.agent import handle_turn
 from app.budget import build_messages, estimate_tokens
@@ -19,6 +22,7 @@ from app.config import Settings, load_settings, load_system_prompt
 from app.github_tool import GITHUB_TOOL_SCHEMA, GithubTool
 from app.llm_client import create_llm_client
 from app.models import ChatRequest, ErrorResponse
+from app.rate_limit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -45,13 +49,23 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         username=settings.github_username,
         token=settings.github_token,
     )
+    rate_limiter = RateLimiter(
+        per_minute=settings.rate_limit_per_minute,
+        enabled=settings.rate_limit_enabled,
+    )
 
     app.state.settings = settings
     app.state.system_prompt = system_prompt
     app.state.llm_client = llm_client
     app.state.github_tool = github_tool
+    app.state.rate_limiter = rate_limiter
 
-    logger.info("Server ready")
+    logger.info(
+        "Server ready — CORS origin=%s rate_limit=%s (%d req/min)",
+        settings.allowed_origin,
+        settings.rate_limit_enabled,
+        settings.rate_limit_per_minute,
+    )
     try:
         yield
     finally:
@@ -63,6 +77,43 @@ app = FastAPI(
     description="LLM-powered portfolio assistant API with SSE streaming",
     version="0.1.0",
     lifespan=lifespan,
+)
+
+_current_app: contextvars.ContextVar[FastAPI | None] = contextvars.ContextVar(
+    "current_app", default=None
+)
+
+
+class AppCORSMiddleware(CORSMiddleware):
+    """Dynamic CORS middleware resolving allowed origin from app.state.settings."""
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            token = _current_app.set(scope.get("app"))
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                _current_app.reset(token)
+            return
+        await super().__call__(scope, receive, send)
+
+    def is_allowed_origin(self, origin: str) -> bool:
+        app_obj = _current_app.get()
+        if app_obj and hasattr(app_obj, "state") and hasattr(app_obj.state, "settings"):
+            allowed = getattr(app_obj.state.settings, "allowed_origin", None)
+            if allowed and origin == allowed:
+                return True
+        return False
+
+
+# Lock CORS to the single allowed origin configured via ALLOWED_ORIGIN.
+# allow_credentials=False means cookies/auth headers are never forwarded.
+app.add_middleware(
+    AppCORSMiddleware,
+    allow_origins=[],
+    allow_methods=["POST", "GET", "OPTIONS"],
+    allow_headers=["Content-Type"],
+    allow_credentials=False,
 )
 
 
@@ -87,6 +138,7 @@ async def health() -> dict[str, str]:
             "content": {"text/event-stream": {}},
         },
         422: {"description": "Request validation error (FastAPI default)"},
+        429: {"model": ErrorResponse, "description": "Rate limit exceeded (too many requests)"},
         500: {"model": ErrorResponse, "description": "Internal server error before stream start"},
     },
     summary="Send a message to the portfolio agent (SSE stream)",
@@ -97,7 +149,19 @@ async def chat(body: ChatRequest, request: Request) -> StreamingResponse | JSONR
 
     Assembles system prompt, conversation history, and current message within token budget,
     and returns a Server-Sent Events stream yielding status, token, done, or error events.
+    Rate-limited per client IP before any LLM or GitHub call is made.
     """
+    # ------------------------------------------------------------------ #
+    # Rate limiting — must be first, before any upstream calls            #
+    # ------------------------------------------------------------------ #
+    ip: str = request.client.host if request.client else "unknown"
+    rate_limiter: RateLimiter | None = getattr(request.app.state, "rate_limiter", None)
+    if rate_limiter is not None and not rate_limiter.is_allowed(ip):
+        return JSONResponse(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            content={"error": "Too many requests. Please wait before sending another message."},
+        )
+
     settings: Settings = request.app.state.settings
     system_prompt: str = request.app.state.system_prompt
     llm_client = request.app.state.llm_client
