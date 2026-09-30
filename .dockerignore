@@ -1,0 +1,46 @@
+.git/
+.gitignore
+.gitattributes
+
+# Secrets — NEVER bake into image; inject at runtime via --env-file
+.env
+.envrc
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test artefacts
+tests/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Documentation (not needed at runtime)
+README.md
+PORTFOLIO_AGENT_SPEC.md
+system_prompt.md.example
+plans/
+
+# IDE / tooling
+.vscode/
+.idea/
+.mypy_cache/
+.ruff_cache/
+.pytype/
+.pyre/
+
+# OS noise
+.DS_Store
+Thumbs.db

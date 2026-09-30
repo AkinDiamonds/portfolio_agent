@@ -150,6 +150,10 @@ activemq-data/
 # Environments
 .env
 .envrc
+
+# Private customisation — keep your real system prompt out of the repo.
+# Forkers: copy system_prompt.md.example → system_prompt.md and edit it.
+system_prompt.md
 .venv
 env/
 venv/

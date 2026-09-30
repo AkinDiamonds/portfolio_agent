@@ -1,0 +1,52 @@
+services:
+
+  portfolio-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: portfolio-agent:latest
+    container_name: portfolio-agent
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  anti-idle:
+    # ── Alpine 3.20 — minimal base, no custom image to build or maintain.
+    # stress-ng and curl are installed at container startup via apk.
+    # The apk install step takes < 5 s on first start and is negligible
+    # on subsequent restarts since Docker caches the Alpine layer.
+    image: alpine:3.20
+    container_name: anti-idle
+    restart: unless-stopped
+    depends_on:
+      portfolio-agent:
+        condition: service_healthy
+    # Resource caps: sidecar is strictly bounded so it can never starve the app.
+    # cpus: 0.30  → max 30% of one core  (stress-ng targets 25%, giving 5% headroom)
+    # mem_limit:  → hard OOM ceiling      (stress-ng allocates 200 MB, giving 56 MB headroom)
+    deploy:
+      resources:
+        limits:
+          cpus: "0.30"
+          memory: 256M
+    command: >
+      sh -c "
+        apk add --no-cache stress-ng curl &&
+        echo '[anti-idle] stress-ng and curl installed, starting load...' &&
+        stress-ng --cpu 1 --cpu-load 25 --vm 1 --vm-bytes 200M --vm-keep --timeout 0 &
+        echo '[anti-idle] CPU/memory stressor running at ~25% CPU, 200 MB RAM' &&
+        while true; do
+          curl -sf http://portfolio-agent:8000/health > /dev/null \
+            && echo '[anti-idle] health ping OK' \
+            || echo '[anti-idle] WARNING: health ping failed';
+          sleep 60;
+        done
+      "
