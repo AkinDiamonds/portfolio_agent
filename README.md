@@ -199,7 +199,7 @@ The token is required to raise your GitHub API rate limit from 60 to 5,000 reque
 ```markdown
 # System Prompt
 
-You are a portfolio assistant for **Jane Smith**, a full-stack developer
+You are a portfolio assistant for **Femi Chika Adamu**, a full-stack developer
 specialising in distributed systems and developer tooling.
 
 You have access to one tool:

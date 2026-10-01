@@ -61,6 +61,7 @@ async def _call_llm_with_retry(
     model: str,
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
+    temperature: float = 0.7,
     max_retries: int = 2,
 ) -> ChatCompletion:
     """Execute a non-streaming chat completion with retries on openai.APIError.
@@ -71,6 +72,7 @@ async def _call_llm_with_retry(
     kwargs: dict[str, Any] = {
         "model": model,
         "messages": messages,
+        "temperature": temperature,
         "stream": False,
     }
     if tools:
@@ -114,6 +116,7 @@ async def _stream_final_answer(
     llm_client: openai.AsyncOpenAI,
     model: str,
     messages: list[dict[str, Any]],
+    temperature: float = 0.7,
     max_retries: int = 2,
 ) -> AsyncGenerator[str, None]:
     """Stream final completion tokens from LLM, yielding SSE token events and concluding with done.
@@ -131,6 +134,7 @@ async def _stream_final_answer(
                 model=model,
                 messages=messages,
                 stream=True,
+                temperature=temperature,
             )
 
             # 1. Handle completion object with choices list (e.g. ChatCompletion or mock)
@@ -220,6 +224,7 @@ async def handle_turn(
                     model=settings.llm_model,
                     messages=working_messages,
                     tools=[GITHUB_TOOL_SCHEMA],
+                    temperature=settings.llm_temperature,
                     max_retries=max_retries,
                 )
             except LLMError as exc:
@@ -270,6 +275,7 @@ async def handle_turn(
                     llm_client=llm_client,
                     model=settings.llm_model,
                     messages=working_messages,
+                    temperature=settings.llm_temperature,
                     max_retries=max_retries,
                 ):
                     yield event

@@ -98,6 +98,14 @@ class Settings(BaseSettings):
         description="Maximum requests per minute per IP when rate limiting is enabled.",
     )
 
+    llm_temperature: float = Field(
+        default=0.7,
+        ge=0.0,
+        le=2.0,
+        description="Sampling temperature for the LLM. Lower is more deterministic, higher is more creative.",
+    )
+
+
     # ------------------------------------------------------------------ #
     # Validators                                                          #
     # ------------------------------------------------------------------ #
