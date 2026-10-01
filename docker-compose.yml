@@ -39,16 +39,20 @@ services:
         limits:
           cpus: "0.30"
           memory: 256M
-    command: >
-      sh -c "
-        apk add --no-cache stress-ng curl &&
-        echo '[anti-idle] stress-ng and curl installed, starting load...' &&
+    command:
+      - /bin/sh
+      - -c
+      - |
+        apk add --no-cache stress-ng curl
+        echo '[anti-idle] stress-ng and curl installed, starting load...'
         stress-ng --cpu 1 --cpu-load 25 --vm 1 --vm-bytes 200M --vm-keep --timeout 0 &
-        echo '[anti-idle] CPU/memory stressor running at ~25% CPU, 200 MB RAM' &&
+        echo '[anti-idle] CPU/memory stressor running at ~25% CPU, 200 MB RAM'
         while true; do
-          curl -sf http://portfolio-agent:8000/health > /dev/null \
-            && echo '[anti-idle] health ping OK' \
-            || echo '[anti-idle] WARNING: health ping failed';
-          sleep 60;
+          if curl -sf http://portfolio-agent:8000/health > /dev/null; then
+            echo '[anti-idle] health ping OK'
+          else
+            echo '[anti-idle] WARNING: health ping failed'
+          fi
+          sleep 60
         done
-      "
+
