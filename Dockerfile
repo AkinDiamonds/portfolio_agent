@@ -11,7 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 
 COPY app/ ./app/
-COPY system_prompt.md .
 
 
 RUN addgroup --system appgroup && \

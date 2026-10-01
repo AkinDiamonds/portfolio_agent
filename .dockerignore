@@ -2,9 +2,10 @@
 .gitignore
 .gitattributes
 
-# Secrets — NEVER bake into image; inject at runtime via --env-file
+# Secrets — NEVER bake into image; inject at runtime via --env-file / volume mounts
 .env
 .envrc
+system_prompt.md
 
 # Python caches
 __pycache__/
